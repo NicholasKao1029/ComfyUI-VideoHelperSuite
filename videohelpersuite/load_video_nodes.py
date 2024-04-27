@@ -210,12 +210,6 @@ class LoadVideoUpload:
         image_path = folder_paths.get_annotated_filepath(video)
         return calculate_file_hash(image_path)
 
-    @classmethod
-    def VALIDATE_INPUTS(s, video, force_size, **kwargs):
-        if not folder_paths.exists_annotated_filepath(video):
-            return "Invalid video file: {}".format(video)
-        return True
-
 
 class LoadVideoPath:
     @classmethod
