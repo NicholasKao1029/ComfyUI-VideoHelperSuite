@@ -174,6 +174,117 @@ async function uploadFile(file) {
         alert(error);
     }
 }
+function applyVHSAudioLinksFix(nodeType, nodeData, audio_slot) {
+    chainCallback(nodeType.prototype, "onConnectionsChange", function(contype, slot, iscon, linfo) {
+        if (contype == LiteGraph.OUTPUT && slot == audio_slot) {
+            if (linfo.type == "VHS_AUDIO") {
+                this.outputs[audio_slot].type = "AUDIO"
+                let tnode = app.graph._nodes_by_id[linfo.target_id]
+                let inputDef = LiteGraph.registered_node_types[tnode.type].nodeData?.input
+                let has_migrated = true
+                if (inputDef?.required) {
+                    for (let k in inputDef.required) {
+                        if (inputDef.required[k][0] == "VHS_AUDIO") {
+                            has_migrated = false
+                            break
+                        }
+                    }
+                }
+                if (has_migrated &&inputDef?.optional) {
+                    for (let k in inputDef.optional) {
+                        if (inputDef.optional[k][0] == "VHS_AUDIO") {
+                            has_migrated = false
+                            break
+                        }
+                    }
+                }
+                if (!has_migrated) {
+                    //need to add node and migrate
+                    app.ui.dialog.show("This workflow contains one or more nodes which use the old VHS_AUDIO format. They have been highlighted in red. An AudioToVHSAudio node must be added to convert to this legacy format")
+                    tnode.bgcolor = "#C00"
+                }
+            }
+        }
+    })
+}
+function addVAEOutputToggle(nodeType, nodeData) {
+    nodeData.output.pop()
+    chainCallback(nodeType.prototype, "onConnectionsChange", function(contype, slot, iscon, linfo) {
+        if (contype == LiteGraph.INPUT && slot == 1 && this.inputs[1].type == "VAE") {
+            if (iscon && linfo) {
+                if (this.linkTimeout) {
+                    clearTimeout(this.linkTimeout)
+                    this.linkTimeout = false
+                } else if (this.outputs[0].type == "IMAGE") {
+                    this.linkTimeout = setTimeout(() => {
+                        this.linkTimeout = false
+                        this.disconnectOutput(0);
+                    }, 50)
+                }
+                this.outputs[0].name = 'LATENT';
+                this.outputs[0].type = 'LATENT';
+            } else{
+                if (this.outputs[0].type == "LATENT") {
+                    this.linkTimeout = setTimeout(() => {
+                        this.linkTimeout = false
+                        this.disconnectOutput(0);
+                    }, 50)
+                }
+                this.outputs[0].name = "IMAGE";
+                this.outputs[0].type = "IMAGE";
+            }
+        }
+    });
+    chainCallback(nodeType.prototype, "onNodeCreated", function(contype, slot, iscon, linf) {
+        this.updateLink = function(link) {
+            if (link.origin_slot == 0 && this.outputs[0].type=="LATENT") {
+                return {'origin_id': link.origin_id,
+                        'origin_slot': 4}
+            }
+            return link
+        }
+    });
+
+}
+function addVAEInputToggle(nodeType, nodeData) {
+    delete nodeData.input.optional["latents"]
+    chainCallback(nodeType.prototype, "onConnectionsChange", function(contype, slot, iscon, linf) {
+        if (contype == LiteGraph.INPUT && slot == 3 && this.inputs[3].type == "VAE") {
+            if (iscon && linf) {
+                if (this.linkTimeout) {
+                    clearTimeout(this.linkTimeout)
+                    this.linkTimeout = false
+                } else if (this.inputs[0].type == "IMAGE") {
+                    this.linkTimeout = setTimeout(() => {
+                        this.linkTimeout = false
+                        this.disconnectInput(0);
+                    }, 50)
+                }
+                this.inputs[0].type = 'LATENT';
+            } else {
+                if (this.inputs[0].type == "LATENT") {
+                    this.linkTimeout = setTimeout(() => {
+                        this.linkTimeout = false
+                        this.disconnectInput(0);
+                    }, 50)
+                }
+                this.inputs[0].type = "IMAGE";
+            }
+        }
+    });
+    chainCallback(nodeType.prototype, "onNodeCreated", function(contype, slot, iscon, linf) {
+        this.original_getInputLink = this.getInputLink
+        this.getInputLink = function(slot) {
+            let link = this.original_getInputLink(slot)
+            if (slot == 0 && this.inputs[0].type=="LATENT") {
+                return {'origin_id': link.origin_id,
+                        'origin_slot': link.origin_slot,
+                        'target_slot': 4}
+            }
+            return link
+        }
+    });
+}
 
 function addDateFormatting(nodeType, field, timestamp_widget = false) {
     chainCallback(nodeType.prototype, "onNodeCreated", function() {
@@ -389,7 +500,18 @@ function addVideoPreview(nodeType) {
             }
             return [width, -4];//no loaded src, widget should not display
         }
-        element.style['pointer-events'] = "none"
+        element.addEventListener('contextmenu', (e)  => {
+            e.preventDefault()
+            return app.canvas._mousedown_callback(e)
+        }, true);
+        element.addEventListener('pointerdown', (e)  => {
+            e.preventDefault()
+            return app.canvas._mousedown_callback(e)
+        }, true);
+        element.addEventListener('mousewheel', (e)  => {
+            e.preventDefault()
+            return app.canvas._mousewheel_callback(e)
+        }, true);
         previewWidget.value = {hidden: false, paused: false, params: {}}
         previewWidget.parentEl = document.createElement("div");
         previewWidget.parentEl.className = "vhs_preview";
@@ -410,6 +532,12 @@ function addVideoPreview(nodeType) {
             previewWidget.parentEl.hidden = true;
             fitHeight(this);
         });
+        previewWidget.videoEl.onmouseenter =  () => {
+            previewWidget.videoEl.muted = false;
+        };
+        previewWidget.videoEl.onmouseleave = () => {
+            previewWidget.videoEl.muted = true;
+        };
 
         previewWidget.imgEl = document.createElement("img");
         previewWidget.imgEl.style['width'] = "100%"
@@ -494,6 +622,8 @@ function addPreviewOptions(nodeType) {
         if (previewWidget.videoEl?.hidden == false && previewWidget.videoEl.src) {
             //Use full quality video
             url = api.apiURL('/view?' + new URLSearchParams(previewWidget.value.params));
+            //Workaround for 16bit png: Just do first frame
+            url = url.replace('%2503d', '001')
         } else if (previewWidget.imgEl?.hidden == false && previewWidget.imgEl.src) {
             url = previewWidget.imgEl.src;
             url = new URL(url);
@@ -964,9 +1094,13 @@ app.registerExtension({
                 });
             });
             addLoadVideoCommon(nodeType, nodeData);
+            addVAEOutputToggle(nodeType, nodeData);
+            applyVHSAudioLinksFix(nodeType, nodeData, 2)
         } else if (nodeData?.name == "VHS_LoadAudioUpload") {
             addUploadWidget(nodeType, nodeData, "audio", "audio");
-  
+            applyVHSAudioLinksFix(nodeType, nodeData, 0)
+        } else if (nodeData?.name == "VHS_LoadAudio"){
+            applyVHSAudioLinksFix(nodeType, nodeData, 0)
         } else if (nodeData?.name =="VHS_LoadVideoPath") {
             chainCallback(nodeType.prototype, "onNodeCreated", function() {
                 const pathWidget = this.widgets.find((w) => w.name === "video");
@@ -983,6 +1117,8 @@ app.registerExtension({
                 });
             });
             addLoadVideoCommon(nodeType, nodeData);
+            addVAEOutputToggle(nodeType, nodeData);
+            applyVHSAudioLinksFix(nodeType, nodeData, 2)
         } else if (nodeData?.name == "VHS_VideoCombine") {
             addDateFormatting(nodeType, "filename_prefix");
             chainCallback(nodeType.prototype, "onExecuted", function(message) {
@@ -993,6 +1129,7 @@ app.registerExtension({
             addVideoPreview(nodeType);
             addPreviewOptions(nodeType);
             addFormatWidgets(nodeType);
+            addVAEInputToggle(nodeType, nodeData)
 
             //Hide the information passing 'gif' output
             //TODO: check how this is implemented for save image
@@ -1118,5 +1255,22 @@ app.registerExtension({
                 batchInput.name = "meta_batch"
             }
         }
+    },
+    async setup() {
+        //cg-use-everywhere link workaround
+        //particularly invasive, plan to remove
+        let originalGraphToPrompt = app.graphToPrompt
+        let graphToPrompt = async function() {
+            let res = await originalGraphToPrompt.apply(this, arguments);
+            for (let n of app.graph._nodes) {
+                if (n?.type?.startsWith('VHS_LoadVideo')) {
+                    if (!n?.inputs[1]?.link && res?.output[n.id]?.inputs?.vae) {
+                        delete res.output[n.id].inputs.vae
+                    }
+                }
+            }
+            return res
+        }
+        app.graphToPrompt = graphToPrompt
     }
 });

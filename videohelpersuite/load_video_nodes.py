@@ -4,11 +4,12 @@ import numpy as np
 import torch
 from PIL import Image, ImageOps
 import cv2
+import psutil
 
 import folder_paths
-from comfy.utils import common_upscale
+from comfy.utils import common_upscale, ProgressBar
 from .logger import logger
-from .utils import BIGMAX, DIMMAX, calculate_file_hash, get_sorted_dir_files_from_directory, get_audio, lazy_eval, hash_path, validate_path
+from .utils import BIGMAX, DIMMAX, calculate_file_hash, get_sorted_dir_files_from_directory, lazy_get_audio, hash_path, validate_path, strip_path
 
 
 video_extensions = ['webm', 'mp4', 'mkv', 'gif']
@@ -19,35 +20,28 @@ def is_gif(filename) -> bool:
     return len(file_parts) > 1 and file_parts[-1] == "gif"
 
 
-def target_size(width, height, force_size, custom_width, custom_height) -> tuple[int, int]:
-    if force_size == "Custom":
-        return (custom_width, custom_height)
-    elif force_size == "Custom Height":
-        force_size = "?x"+str(custom_height)
-    elif force_size == "Custom Width":
-        force_size = str(custom_width)+"x?"
-
-    if force_size != "Disabled":
-        force_size = force_size.split("x")
-        if force_size[0] == "?":
-            width = (width*int(force_size[1]))//height
-            #Limit to a multple of 8 for latent conversion
-            width = int(width)+4 & ~7
-            height = int(force_size[1])
-        elif force_size[1] == "?":
-            height = (height*int(force_size[0]))//width
-            height = int(height)+4 & ~7
-            width = int(force_size[0])
-        else:
-            width = int(force_size[0])
-            height = int(force_size[1])
+def target_size(width, height, force_size, custom_width, custom_height, downscale_ratio=8) -> tuple[int, int]:
+    if force_size == "Disabled":
+        pass
+    elif force_size == "Custom Width" or force_size.endswith('x?'):
+        height *= custom_width/width
+        width = custom_width
+    elif force_size == "Custom Height" or force_size.startswith('?x'):
+        width *= custom_height/height
+        height = custom_height
+    else:
+        width = custom_width
+        height = custom_height
+    width = int(width/downscale_ratio + 0.5) * downscale_ratio
+    height = int(height/downscale_ratio + 0.5) * downscale_ratio
     return (width, height)
 
 def cv_frame_generator(video, force_rate, frame_load_cap, skip_first_frames,
                        select_every_nth, meta_batch=None, unique_id=None):
-    video_cap = cv2.VideoCapture(video)
+    video_cap = cv2.VideoCapture(strip_path(video))
     if not video_cap.isOpened():
         raise ValueError(f"{video} could not be loaded with cv.")
+    pbar = ProgressBar(frame_load_cap) if frame_load_cap > 0 else None
 
     # extract video metadata
     fps = video_cap.get(cv2.CAP_PROP_FPS)
@@ -69,6 +63,8 @@ def cv_frame_generator(video, force_rate, frame_load_cap, skip_first_frames,
         target_frame_time = 1/force_rate
 
     yield (width, height, fps, duration, total_frames, target_frame_time)
+    if meta_batch is not None:
+        yield min(frame_load_cap, total_frames)
 
     time_offset=target_frame_time - base_frame_time
     while video_cap.isOpened():
@@ -99,7 +95,8 @@ def cv_frame_generator(video, force_rate, frame_load_cap, skip_first_frames,
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         # convert frame to comfyui's expected format
         # TODO: frame contains no exif information. Check if opencv2 has already applied
-        frame = np.array(frame, dtype=np.float32) / 255.0
+        frame = np.array(frame, dtype=np.float32)
+        torch.from_numpy(frame).div_(255)
         if prev_frame is not None:
             inp  = yield prev_frame
             if inp is not None:
@@ -107,6 +104,8 @@ def cv_frame_generator(video, force_rate, frame_load_cap, skip_first_frames,
                 return
         prev_frame = frame
         frames_added += 1
+        if pbar is not None:
+            pbar.update_absolute(frames_added, frame_load_cap)
         # if cap exists and we've reached it, stop processing frames
         if frame_load_cap > 0 and frames_added >= frame_load_cap:
             break
@@ -116,10 +115,19 @@ def cv_frame_generator(video, force_rate, frame_load_cap, skip_first_frames,
     if prev_frame is not None:
         yield prev_frame
 
+#Python 3.12 adds an itertools.batched, but it's easily replicated for legacy support
+def batched(it, n):
+    while batch := tuple(itertools.islice(it, n)):
+        yield batch
+def batched_vae_encode(images, vae, frames_per_batch):
+    for batch in batched(images, frames_per_batch):
+        image_batch = torch.from_numpy(np.array(batch))
+        yield from vae.encode(image_batch).numpy()
+
 def load_video_cv(video: str, force_rate: int, force_size: str,
                   custom_width: int,custom_height: int, frame_load_cap: int,
                   skip_first_frames: int, select_every_nth: int,
-                  meta_batch=None, unique_id=None):
+                  meta_batch=None, unique_id=None, memory_limit_mb=None, vae=None):
     if meta_batch is None or unique_id not in meta_batch.inputs:
         gen = cv_frame_generator(video, force_rate, frame_load_cap, skip_first_frames,
                                  select_every_nth, meta_batch, unique_id)
@@ -127,26 +135,67 @@ def load_video_cv(video: str, force_rate: int, force_size: str,
 
         if meta_batch is not None:
             meta_batch.inputs[unique_id] = (gen, width, height, fps, duration, total_frames, target_frame_time)
+            meta_batch.total_frames = min(meta_batch.total_frames, next(gen))
 
     else:
         (gen, width, height, fps, duration, total_frames, target_frame_time) = meta_batch.inputs[unique_id]
 
-    if meta_batch is not None:
-        gen = itertools.islice(gen, meta_batch.frames_per_batch)
-
-    #Some minor wizardry to eliminate a copy and reduce max memory by a factor of ~2
-    images = torch.from_numpy(np.fromiter(gen, np.dtype((np.float32, (height, width, 3)))))
+    memory_limit = None
+    if memory_limit_mb is not None:
+        memory_limit *= 2 ** 20
+    else:
+        #TODO: verify if garbage collection should be performed here.
+        #leaves ~128 MB unreserved for safety
+        try:
+            memory_limit = (psutil.virtual_memory().available + psutil.swap_memory().free) - 2 ** 27
+        except:
+            logger.warn("Failed to calculate available memory. Memory load limit has been disabled")
+    if memory_limit is not None:
+        if vae is not None:
+            #space required to load as f32, exist as latent with wiggle room, decode to f32
+            max_loadable_frames = int(memory_limit//(width*height*3*(4+4+1/10)))
+        else:
+            #TODO: use better estimate for when vae is not None
+            #Consider completely ignoring for load_latent case?
+            max_loadable_frames = int(memory_limit//(width*height*3*(.1)))
+        if meta_batch is not None:
+            if meta_batch.frames_per_batch > max_loadable_frames:
+                raise RuntimeError(f"Meta Batch set to {meta_batch.frames_per_batch} frames but only {max_loadable_frames} can fit in memory")
+            gen = itertools.islice(gen, meta_batch.frames_per_batch)
+        else:
+            original_gen = gen
+            gen = itertools.islice(gen, max_loadable_frames)
+    downscale_ratio = getattr(vae, "downscale_ratio", 8)
+    frames_per_batch = (1920 * 1080 * 16) // (width * height) or 1
+    if force_size != "Disabled" or vae is not None:
+        new_size = target_size(width, height, force_size, custom_width, custom_height, downscale_ratio)
+        if new_size[0] != width or new_size[1] != height:
+            def rescale(frame):
+                s = torch.from_numpy(np.fromiter(frame, np.dtype((np.float32, (height, width, 3)))))
+                s = s.movedim(-1,1)
+                s = common_upscale(s, new_size[0], new_size[1], "lanczos", "center")
+                return s.movedim(1,-1).numpy()
+            gen = itertools.chain.from_iterable(map(rescale, batched(gen, frames_per_batch)))
+    else:
+        new_size = width, height
+    if vae is not None:
+        gen = batched_vae_encode(gen, vae, frames_per_batch)
+        vw,vh = new_size[0]//downscale_ratio, new_size[1]//downscale_ratio
+        images = torch.from_numpy(np.fromiter(gen, np.dtype((np.float32, (4,vh,vw)))))
+    else:
+        #Some minor wizardry to eliminate a copy and reduce max memory by a factor of ~2
+        images = torch.from_numpy(np.fromiter(gen, np.dtype((np.float32, (new_size[1], new_size[0], 3)))))
+    if meta_batch is None and memory_limit is not None:
+        try:
+            next(original_gen)
+            raise RuntimeError(f"Memory limit hit after loading {len(images)} frames. Stopping execution.")
+        except StopIteration:
+            pass
     if len(images) == 0:
         raise RuntimeError("No frames generated")
-    if force_size != "Disabled":
-        new_size = target_size(width, height, force_size, custom_width, custom_height)
-        if new_size[0] != width or new_size[1] != height:
-            s = images.movedim(-1,1)
-            s = common_upscale(s, new_size[0], new_size[1], "lanczos", "center")
-            images = s.movedim(1,-1)
 
     #Setup lambda for lazy audio capture
-    audio = lambda : get_audio(video, skip_first_frames * target_frame_time,
+    audio = lazy_get_audio(video, skip_first_frames * target_frame_time,
                                frame_load_cap*target_frame_time*select_every_nth)
     #Adjust target_frame_time for select_every_nth
     target_frame_time *= select_every_nth
@@ -159,11 +208,14 @@ def load_video_cv(video: str, force_rate: int, force_size: str,
         "loaded_fps": 1/target_frame_time,
         "loaded_frame_count": len(images),
         "loaded_duration": len(images) * target_frame_time,
-        "loaded_width": images.shape[2],
-        "loaded_height": images.shape[1],
+        "loaded_width": new_size[0],
+        "loaded_height": new_size[1],
     }
+    if vae is None:
+        return (images, len(images), audio, video_info, None)
+    else:
+        return (None, len(images), audio, video_info, {"samples": images})
 
-    return (images, len(images), lazy_eval(audio), video_info)
 
 
 class LoadVideoUpload:
@@ -187,7 +239,8 @@ class LoadVideoUpload:
                      "select_every_nth": ("INT", {"default": 1, "min": 1, "max": BIGMAX, "step": 1}),
                      },
                 "optional": {
-                    "meta_batch": ("VHS_BatchManager",)
+                    "meta_batch": ("VHS_BatchManager",),
+                    "vae": ("VAE",),
                 },
                 "hidden": {
                     "unique_id": "UNIQUE_ID"
@@ -196,13 +249,13 @@ class LoadVideoUpload:
 
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
 
-    RETURN_TYPES = ("IMAGE", "INT", "VHS_AUDIO", "VHS_VIDEOINFO",)
-    RETURN_NAMES = ("IMAGE", "frame_count", "audio", "video_info",)
+    RETURN_TYPES = ("IMAGE", "INT", "AUDIO", "VHS_VIDEOINFO", "LATENT")
+    RETURN_NAMES = ("IMAGE", "frame_count", "audio", "video_info", "LATENT")
 
     FUNCTION = "load_video"
 
     def load_video(self, **kwargs):
-        kwargs['video'] = folder_paths.get_annotated_filepath(kwargs['video'].strip("\""))
+        kwargs['video'] = folder_paths.get_annotated_filepath(strip_path(kwargs['video']))
         return load_video_cv(**kwargs)
 
     @classmethod
@@ -226,7 +279,8 @@ class LoadVideoPath:
                 "select_every_nth": ("INT", {"default": 1, "min": 1, "max": BIGMAX, "step": 1}),
             },
             "optional": {
-                "meta_batch": ("VHS_BatchManager",)
+                "meta_batch": ("VHS_BatchManager",),
+                "vae": ("VAE",),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID"
@@ -235,8 +289,8 @@ class LoadVideoPath:
 
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
 
-    RETURN_TYPES = ("IMAGE", "INT", "VHS_AUDIO", "VHS_VIDEOINFO",)
-    RETURN_NAMES = ("IMAGE", "frame_count", "audio", "video_info",)
+    RETURN_TYPES = ("IMAGE", "INT", "AUDIO", "VHS_VIDEOINFO", "LATENT")
+    RETURN_NAMES = ("IMAGE", "frame_count", "audio", "video_info", "LATENT")
 
     FUNCTION = "load_video"
 
